@@ -1,13 +1,15 @@
-//package ru.netology.coroutines
+
 
 import com.google.gson.Gson
 import com.google.gson.reflect.TypeToken
+import dto.Author
 import kotlinx.coroutines.*
 import okhttp3.*
 import okhttp3.logging.HttpLoggingInterceptor
 import dto.Comment
+import dto.CommentWithAuthor
 import dto.Post
-import dto.PostWithComments
+import dto.PostWithDetails
 import java.io.IOException
 import java.util.concurrent.TimeUnit
 import kotlin.coroutines.EmptyCoroutineContext
@@ -25,23 +27,23 @@ private val client = OkHttpClient.Builder()
     .build()
 
 fun main() {
+    println("╔════════════════════════════════════════╗")
+    println("║   📱 Загрузчик постов с авторами       ║")
+    println("╚════════════════════════════════════════╝")
+
     with(CoroutineScope(EmptyCoroutineContext)) {
         launch {
             try {
+                println("⏳ Загрузка данных...")
                 // Получаем посты
                 val posts = getPosts(client)
+                println("✅ Загружено постов: ${posts.size}")
 
-                // Параллельно получаем комментарии для всех постов
-                val postsWithComments = posts
-                    .map { post ->
-                        async {
-                            PostWithComments(post, getComments(client, post.id))
-                        }
-                    }
-                    .awaitAll()
+                // Загружаем авторов для постов и комментарии с авторами
+                val postsWithDetails = loadPostsWithAuthorsAndComments(posts)
 
-                // ВЫВОДИМ СПИСОК В КОНСОЛЬ
-                printPostsWithComments(postsWithComments)
+                // Выводим результат
+                printPostsWithDetails(postsWithDetails)
 
             } catch (e: Exception) {
                 println("❌ Ошибка: ${e.message}")
@@ -51,69 +53,158 @@ fun main() {
     }
 
     // Даем время на выполнение запросов
-    println("⏳ Загрузка данных...")
     Thread.sleep(30_000L)
 }
 
-// Функция для красивого вывода постов с комментариями
-fun printPostsWithComments(postsWithComments: List<PostWithComments>) {
-    println("\n" + "=".repeat(80))
-    println("📱 ПОЛУЧЕННЫЕ ДАННЫЕ")
-    println("=".repeat(80))
+suspend fun loadPostsWithAuthorsAndComments(posts: List<Post>): List<PostWithDetails> = coroutineScope {
+    // Кэш для авторов, чтобы не загружать одного автора несколько раз
+    val authorCache = mutableMapOf<Long, Author>()
 
-    if (postsWithComments.isEmpty()) {
+    // Сначала загружаем всех уникальных авторов постов
+    val postAuthorIds = posts.map { it.authorId }.toSet()
+    val postAuthors = postAuthorIds.map { authorId ->
+        async {
+            authorId to loadAuthor(authorId)
+        }
+    }.awaitAll()
+
+    // Фильтруем только успешно загруженных авторов (не null)
+    postAuthors.forEach { (id, author) ->
+        if (author != null) {
+            authorCache[id] = author
+        }
+    }
+
+    // Теперь для каждого поста загружаем комментарии и их авторов
+    posts.map { post ->
+        async {
+            // Получаем комментарии для поста
+            val comments = getComments(client, post.id)
+
+            // Загружаем авторов комментариев (только тех, кого еще нет в кэше)
+            val commentAuthorIds = comments.map { it.authorId }.toSet()
+            val newAuthorIds = commentAuthorIds - authorCache.keys
+
+            if (newAuthorIds.isNotEmpty()) {
+                val newAuthors = newAuthorIds.map { authorId ->
+                    async {
+                        authorId to loadAuthor(authorId)
+                    }
+                }.awaitAll()
+
+                // Добавляем только успешно загруженных авторов
+                newAuthors.forEach { (id, author) ->
+                    if (author != null) {
+                        authorCache[id] = author
+                    }
+                }
+            }
+
+            // Создаем комментарии с авторами
+            val commentsWithAuthors = comments.map { comment ->
+                CommentWithAuthor(
+                    comment = comment,
+                    author = authorCache[comment.authorId]
+                )
+            }
+
+            // Создаем пост с деталями
+            PostWithDetails(
+                post = post,
+                author = authorCache[post.authorId],
+                comments = commentsWithAuthors
+            )
+        }
+    }.awaitAll()
+}
+
+suspend fun loadAuthor(authorId: Long): Author? {
+    return try {
+        makeRequest("$BASE_URL/api/authors/$authorId", client, object : TypeToken<Author>() {})
+    } catch (e: Exception) {
+        println("⚠️ Не удалось загрузить автора с ID $authorId: ${e.message}")
+        null
+    }
+}
+
+fun printPostsWithDetails(postsWithDetails: List<PostWithDetails>) {
+    println("\n" + "═".repeat(100))
+    println("📱 РЕЗУЛЬТАТЫ ЗАГРУЗКИ")
+    println("═".repeat(100))
+
+    if (postsWithDetails.isEmpty()) {
         println("❌ Нет постов для отображения")
         return
     }
 
-    postsWithComments.forEachIndexed { index, item ->
+    postsWithDetails.forEachIndexed { index, item ->
         val post = item.post
+        val author = item.author
         val comments = item.comments
 
         println("\n📌 ПОСТ #${index + 1} (ID: ${post.id})")
-        println("   👤 Автор: ${post.author}")
-        println("   🖼️ Аватар: ${post.authorAvatar}")
+
+        // Информация об авторе поста
+        if (author != null) {
+            println("   👤 Автор: ${author.name} (ID: ${post.authorId})")
+            println("   🖼️ Аватар: ${author.avatar}")
+        } else {
+            println("   👤 Автор: ID ${post.authorId} (не загружен)")
+            println("   🖼️ Аватар: не доступен")
+        }
+
+        // Содержание поста
         println("   💬 Содержание: ${post.content}")
         println("   📅 Дата: ${post.published}")
-        println("   ❤️ Лайки: ${post.likes} ${if (post.likedByMe) "(Вам нравится)" else ""}")
+        println("   ❤️ Лайки: ${post.likes} ${if (post.likedByMe) "👍" else ""}")
 
+        // Вложение если есть
+        post.attachment?.let { attachment ->
+            println("   📎 Вложение: ${attachment.url}")
+            println("   📝 Описание: ${attachment.description}")
+            println("   🏷️ Тип: ${attachment.type}")
+        }
+
+        // Комментарии
         if (comments.isNotEmpty()) {
             println("\n   💭 КОММЕНТАРИИ (${comments.size}):")
-            comments.forEachIndexed { commentIndex, comment ->
-                println("      ${commentIndex + 1}. ${comment.author}:")
-                println("         ${comment.content}")
-                println("         🖼️ Аватар: ${comment.authorAvatar}")
-                println("         ❤️ ${comment.likes} ${if (comment.likedByMe) "(Вам нравится)" else ""}")
-                println("         " + "-".repeat(40))
+            comments.forEachIndexed { commentIndex, commentWithAuthor ->
+                val comment = commentWithAuthor.comment
+                val commentAuthor = commentWithAuthor.author
+
+                println("      ${commentIndex + 1}. Комментарий ID: ${comment.id}")
+
+                if (commentAuthor != null) {
+                    println("         👤 Автор: ${commentAuthor.name} (ID: ${comment.authorId})")
+                    println("         🖼️ Аватар: ${commentAuthor.avatar}")
+                } else {
+                    println("         👤 Автор: ID ${comment.authorId} (не загружен)")
+                }
+
+                println("         💬 ${comment.content}")
+                println("         ❤️ ${comment.likes} ${if (comment.likedByMe) "👍" else ""}")
+                println("         " + "─".repeat(40))
             }
         } else {
             println("\n   💭 Комментариев нет")
         }
 
-        println("   " + "═".repeat(70))
+        println("   " + "─".repeat(90))
     }
 
-    println("\n📊 ВСЕГО ПОСТОВ: ${postsWithComments.size}")
-    println("=".repeat(80))
-}
+    println("\n📊 ВСЕГО ПОСТОВ: ${postsWithDetails.size}")
 
-// Вспомогательная функция для вывода только постов (без комментариев)
-fun printPosts(posts: List<Post>) {
-    println("\n" + "=".repeat(80))
-    println("📱 ПОСТЫ (БЕЗ КОММЕНТАРИЕВ)")
-    println("=".repeat(80))
-
-    posts.forEachIndexed { index, post ->
-        println("\n📌 ПОСТ #${index + 1} (ID: ${post.id})")
-        println("   👤 Автор: ${post.author}")
-        println("   🖼️ Аватар: ${post.authorAvatar}")
-        println("   💬 Содержание: ${post.content}")
-        println("   ❤️ Лайки: ${post.likes} ${if (post.likedByMe) "(Вам нравится)" else ""}")
-        println("   " + "─".repeat(50))
+    // Подсчет статистики
+    val totalComments = postsWithDetails.sumOf { it.comments.size }
+    val loadedAuthors = postsWithDetails.count { it.author != null }
+    val loadedCommentAuthors = postsWithDetails.sumOf { post ->
+        post.comments.count { it.author != null }
     }
 
-    println("\n📊 Всего постов: ${posts.size}")
-    println("=".repeat(80))
+    println("📊 ВСЕГО КОММЕНТАРИЕВ: $totalComments")
+    println("📊 Загружено авторов постов: $loadedAuthors из ${postsWithDetails.size}")
+    println("📊 Загружено авторов комментариев: $loadedCommentAuthors из $totalComments")
+    println("═".repeat(100))
 }
 
 suspend fun OkHttpClient.apiCall(url: String): Response {
